@@ -5,17 +5,16 @@ on:
     branches:
       - main
       - nightly
+  workflow_dispatch: # Allows you to run it manually from the "Actions" tab
 
 env:
   BIN_NAME: panel-rs
   PROJECT_NAME: panel-rs
-  REPO_NAME: calagopus/panel
 
 jobs:
   build-frontend:
     name: Build Frontend
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -61,49 +60,15 @@ jobs:
           path: frontend/dist/
 
   dist:
-    name: Dist
+    name: Build ARMv7 Binary
     needs: [build-frontend]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
-        build:
-          - x86_64-linux
-          - aarch64-linux
-          - riscv64-linux
-          - ppc64le-linux
-          - x86_64-macos
-          - aarch64-macos
-          - x86_64-windows
         include:
-          - build: x86_64-linux
-            os: blacksmith-2vcpu-ubuntu-2404
-            target: x86_64-unknown-linux-musl
+          - build: armv7-linux
+            target: armv7-unknown-linux-musleabihf # Best for 32-bit ARM on Android TV
             binary_suffix: ""
-          - build: aarch64-linux
-            os: blacksmith-2vcpu-ubuntu-2404
-            target: aarch64-unknown-linux-musl
-            binary_suffix: ""
-          - build: riscv64-linux
-            os: blacksmith-2vcpu-ubuntu-2404
-            target: riscv64gc-unknown-linux-gnu
-            binary_suffix: ""
-          - build: ppc64le-linux
-            os: blacksmith-2vcpu-ubuntu-2404
-            target: powerpc64le-unknown-linux-gnu
-            binary_suffix: ""
-          - build: x86_64-macos
-            os: macos-latest
-            target: x86_64-apple-darwin
-            binary_suffix: ""
-          - build: aarch64-macos
-            os: macos-latest
-            target: aarch64-apple-darwin
-            binary_suffix: ""
-          - build: x86_64-windows
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary_suffix: ".exe"
 
     steps:
       - name: Checkout sources
@@ -114,12 +79,6 @@ jobs:
         with:
           name: frontend-build
           path: frontend/dist/
-
-      - name: Install Windows extra tools
-        if: runner.os == 'Windows'
-        run: |
-          choco install nasm
-          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -140,150 +99,14 @@ jobs:
         if: contains(matrix.target, 'linux')
         run: cross test --target ${{ matrix.target }}
 
-      - name: Run tests (Non-Linux)
-        if: ${{ !contains(matrix.target, 'linux') }}
-        run: cargo test --target ${{ matrix.target }}
-
       - name: Build release binary (Linux)
         if: contains(matrix.target, 'linux')
         run: |
           RUSTFLAGS="-C target-feature=+crt-static" \
           cross build --release --target ${{ matrix.target }}
 
-      - name: Build release binary (Non-Linux)
-        if: ${{ !contains(matrix.target, 'linux') }}
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Prepare binary (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/$BIN_NAME${{ matrix.binary_suffix }}" "dist/$BIN_NAME-${{ matrix.build }}"
-
-      - name: Prepare binary (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist
-          Copy-Item "target\${{ matrix.target }}\release\$env:BIN_NAME${{ matrix.binary_suffix }}" "dist\$env:BIN_NAME-${{ matrix.build }}${{ matrix.binary_suffix }}"
-
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PROJECT_NAME }}-${{ matrix.build }}
-          path: dist/${{ env.BIN_NAME }}-${{ matrix.build }}${{ matrix.binary_suffix }}
-
-  publish:
-    name: Publish
-    needs: [dist]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: ${{ env.PROJECT_NAME }}*
-
-      - name: Fetch version from Cargo.toml
-        id: version
-        run: echo "val=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].version')" >> $GITHUB_OUTPUT
-
-      - name: Upload binaries to GitHub Release (main)
-        if: github.ref == 'refs/heads/main'
-        uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: artifacts/${{ env.PROJECT_NAME }}-*/*
-          file_glob: true
-          tag: ${{ steps.version.outputs.val }}
-          overwrite: true
-
-  create-multiarch-image:
-    name: Create multi-arch Docker image
-    needs: [dist]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
-
-      - name: Set up Docker Buildx
-        uses: useblacksmith/setup-docker-builder@v1
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Prepare binaries
-        run: |
-          mkdir -p .docker/amd64 .docker/arm64 .docker/riscv64 .docker/ppc64le .docker/s390x
-          cp dist/${{ env.PROJECT_NAME }}-x86_64-linux/${{ env.BIN_NAME }}-x86_64-linux .docker/amd64/panel-rs
-          cp dist/${{ env.PROJECT_NAME }}-aarch64-linux/${{ env.BIN_NAME }}-aarch64-linux .docker/arm64/panel-rs
-          cp dist/${{ env.PROJECT_NAME }}-riscv64-linux/${{ env.BIN_NAME }}-riscv64-linux .docker/riscv64/panel-rs
-          cp dist/${{ env.PROJECT_NAME }}-ppc64le-linux/${{ env.BIN_NAME }}-ppc64le-linux .docker/ppc64le/panel-rs
-
-          chmod +x .docker/*/panel-rs
-
-      - name: Extract version
-        id: version
-        run: echo "val=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].version')" >> $GITHUB_OUTPUT
-
-      - name: Build & push multi-arch image (main)
-        if: github.ref == 'refs/heads/main'
-        uses: useblacksmith/build-push-action@v2
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64,linux/riscv64,linux/ppc64le
-          push: true
-          tags: ghcr.io/${{ env.REPO_NAME }}:latest,ghcr.io/${{ env.REPO_NAME }}:nightly,ghcr.io/${{ env.REPO_NAME }}:${{ steps.version.outputs.val }}
-
-      - name: Build & push multi-arch image (nightly)
-        if: github.ref == 'refs/heads/nightly'
-        uses: useblacksmith/build-push-action@v2
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64,linux/riscv64,linux/ppc64le
-          push: true
-          tags: ghcr.io/${{ env.REPO_NAME }}:nightly
-
-      - name: Build & push multi-arch heavy image (main)
-        if: github.ref == 'refs/heads/main'
-        uses: useblacksmith/build-push-action@v2
-        with:
-          context: .
-          file: Dockerfile.heavy
-          platforms: linux/amd64,linux/arm64
-          #,linux/riscv64,linux/ppc64le
-          push: true
-          tags: ghcr.io/${{ env.REPO_NAME }}:heavy,ghcr.io/${{ env.REPO_NAME }}:nightly-heavy,ghcr.io/${{ env.REPO_NAME }}:${{ steps.version.outputs.val }}-heavy
-
-      - name: Build & push multi-arch heavy image (nightly)
-        if: github.ref == 'refs/heads/nightly'
-        uses: useblacksmith/build-push-action@v2
-        with:
-          context: .
-          file: Dockerfile.heavy
-          platforms: linux/amd64,linux/arm64
-          #,linux/riscv64,linux/ppc64le
-          push: true
-          tags: ghcr.io/${{ env.REPO_NAME }}:nightly-heavy
+          path: target/${{ matrix.target }}/release/${{ env.BIN_NAME }}${{ matrix.binary_suffix }}
